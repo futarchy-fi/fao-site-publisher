@@ -1,0 +1,2 @@
+pycryptodome==3.22.0 \
+    --hash=sha256:a0092fd476701eeeb04df5cc509d8b739fa381583cda6a46ff0a60639b7cd70d

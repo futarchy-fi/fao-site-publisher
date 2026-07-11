@@ -1,0 +1,9 @@
+#!/bin/sh
+exec /usr/bin/ssh \
+  -F /dev/null \
+  -i /etc/fao-site-publisher/deploy-key \
+  -o IdentitiesOnly=yes \
+  -o IdentityAgent=none \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/etc/fao-site-publisher/known_hosts \
+  "$@"

@@ -1,0 +1,21 @@
+{
+  "rpc_url": "https://sepolia.example.invalid",
+  "witness_rpc_url": "https://sepolia-witness.example.invalid",
+  "chain_id": 11155111,
+  "strategy_address": "0x0000000000000000000000000000000000000000",
+  "start_block": 0,
+  "confirmations": 12,
+  "poll_seconds": 15,
+  "log_chunk_size": 1000,
+  "http_timeout": 120,
+  "state_dir": "/var/lib/fao-site-publisher",
+  "worktree": "/srv/fao-governed-site",
+  "ipfs_gateway": "https://cloudflare-ipfs.com",
+  "max_archive_bytes": 52428800,
+  "max_extracted_bytes": 52428800,
+  "max_file_bytes": 26214400,
+  "max_files": 20000,
+  "git_commit": true,
+  "git_push": true,
+  "git_ssh": "/usr/local/libexec/fao-git-ssh"
+}
