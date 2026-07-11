@@ -22,8 +22,10 @@ release alone.
   ownership, modes, and timestamps so the exact archive bytes are reproducible;
   the publisher hashes the downloaded bytes without normalization.
 - The archive has exactly one top-level directory. That directory is stripped;
-  its regular files become the repository root. Directories are structural;
-  empty directories and archive modes are not release state.
+  its regular files become the repository root. Directories are structural and
+  empty directories are not release state. A regular file's executable bit is
+  preserved as Git mode `100755` or `100644`; all other archive mode bits are
+  normalized.
 - Symlinks, hardlinks, devices, FIFOs, absolute/traversing paths, duplicate or
   case-colliding paths, `.git`, oversize archives/files/trees, and excessive
   file or directory-entry counts are rejected. The configured limits must not

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import socket
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -30,12 +31,12 @@ def event_log(
     nonce: int,
     digest: str,
     previous: str,
-    uri: str,
+    uri: str | bytes,
     block: int,
     block_hash: str,
     log_index: int = 0,
 ) -> dict[str, Any]:
-    encoded_uri = uri.encode()
+    encoded_uri = uri if isinstance(uri, bytes) else uri.encode()
     padded_uri = encoded_uri + (b"\0" * ((32 - len(encoded_uri) % 32) % 32))
     data = b"".join(
         [
@@ -288,6 +289,32 @@ class PublisherTest(unittest.TestCase):
         self.assertEqual((target / "index.html").read_bytes(), b"hello")
         self.assertEqual((target / "assets/app.js").read_bytes(), b"data")
         self.assertFalse((target / "release").exists())
+
+    def test_preserves_only_the_git_executable_bit(self) -> None:
+        archive_path = self.root / "executable.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            root = tarfile.TarInfo("release")
+            root.type = tarfile.DIRTYPE
+            archive.addfile(root)
+            script = tarfile.TarInfo("release/deploy.sh")
+            script.mode = 0o6751
+            script.size = 10
+            archive.addfile(script, io.BytesIO(b"#!/bin/sh\n"))
+
+        extracted = self.root / "executable-tree"
+        publisher.extract_archive(archive_path, extracted, self.config())
+        self.assertEqual(stat.S_IMODE((extracted / "deploy.sh").stat().st_mode), 0o755)
+
+        actions = publisher.ReleaseActions(self.config(git_commit=True))
+        publisher.replace_worktree(extracted, self.worktree)
+        actions._index_exact_tree()
+        index = subprocess.run(
+            ["/usr/bin/git", "-C", str(self.worktree), "ls-files", "--stage", "deploy.sh"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertTrue(index.startswith("100755 "))
 
     def test_rejects_path_traversal_absolute_duplicates_and_case_collisions(self) -> None:
         cases = [
@@ -628,6 +655,56 @@ class PublisherTest(unittest.TestCase):
         )
         self.assertEqual(watcher.sync_once(), 1)
         self.assertEqual([event.nonce for event in applier.applied if event], [2])
+
+    def test_invalid_utf8_uri_does_not_block_a_later_valid_release(self) -> None:
+        class FetchBoundaryApplier(FakeApplier):
+            def apply(self, event: publisher.ReleaseEvent | None) -> None:
+                if event is not None:
+                    publisher.artifact_url(event.uri, "https://ipfs.example")
+                super().apply(event)
+
+        rpc = FakeRpc(7)
+        digest1 = hash32("invalid-uri")
+        digest2 = hash32("recovery")
+        rpc.log_values = [
+            event_log(
+                1,
+                digest1,
+                publisher.ZERO_DIGEST,
+                b"https://example.com/\xff.tar",
+                5,
+                rpc.hashes[5],
+            ),
+            event_log(
+                2,
+                digest2,
+                digest1,
+                "https://example.com/recovery.tar",
+                6,
+                rpc.hashes[6],
+            ),
+        ]
+        applier = FetchBoundaryApplier()
+        watcher = publisher.ReleaseWatcher(self.config(log_chunk_size=1), rpc, applier)
+
+        with self.assertRaisesRegex(publisher.UnsafeArtifact, "valid UTF-8"):
+            watcher.sync_once()
+        self.assertFalse((self.state / "cursor.json").exists())
+
+        rpc.head_value = 10
+        self.assertEqual(watcher.sync_once(), 1)
+        self.assertEqual([event.nonce for event in applier.applied if event], [2])
+
+        invalid = publisher.decode_release_log(rpc.log_values[0])
+        restored = publisher.ReleaseEvent.from_dict(
+            json.loads(json.dumps(invalid.to_dict()))
+        )
+        self.assertEqual(
+            restored.uri.encode("utf-8", errors="surrogateescape"),
+            b"https://example.com/\xff.tar",
+        )
+        with self.assertRaisesRegex(publisher.UnsafeArtifact, "valid UTF-8"):
+            publisher.artifact_url(invalid.uri, "https://ipfs.example")
 
     def test_wrong_rpc_chain_fails_before_cursor_creation(self) -> None:
         rpc = FakeRpc(10)
