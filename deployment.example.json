@@ -1,0 +1,13 @@
+{
+  "chain_id": 11155111,
+  "strategy_address": "0x0000000000000000000000000000000000000000",
+  "start_block": 0,
+  "confirmations": 12,
+  "log_chunk_size": 1000,
+  "http_timeout": 120,
+  "ipfs_gateway": "https://cloudflare-ipfs.com",
+  "max_archive_bytes": 52428800,
+  "max_extracted_bytes": 52428800,
+  "max_file_bytes": 26214400,
+  "max_files": 20000
+}

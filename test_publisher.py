@@ -439,14 +439,20 @@ class PublisherTest(unittest.TestCase):
             )
 
     def test_governance_can_replace_workflows_and_server_code(self) -> None:
-        digest = hash32("cached-policy")
-        first = publisher.ReleaseActions(self.config())
-        cached = first.trees / digest[2:]
-        (cached / ".github/workflows").mkdir(parents=True)
-        (cached / ".github/workflows/pwn.yml").write_text("on: push", encoding="utf-8")
-        (cached / "functions").mkdir()
-        (cached / "functions/api.js").write_text("export function onRequest() {}")
-        (cached / "_worker.js").write_text("export default {}", encoding="utf-8")
+        archive = self.root / "governed-code.tar"
+        self.tar_archive(
+            [
+                ("release/.github/workflows/pwn.yml", b"on: push"),
+                ("release/functions/api.js", b"export function onRequest() {}"),
+                ("release/_worker.js", b"export default {}"),
+            ],
+            archive,
+        )
+        digest = publisher._keccak_file(archive)
+        actions = publisher.ReleaseActions(self.config())
+        cached_archive = actions.archives / f"{digest[2:]}.archive"
+        cached_archive.write_bytes(archive.read_bytes())
+        cached_archive.chmod(0o600)
         event = publisher.ReleaseEvent(
             1,
             2,
@@ -460,10 +466,67 @@ class PublisherTest(unittest.TestCase):
             0,
             0,
         )
-        publisher.ReleaseActions(self.config()).apply(event)
+        actions.apply(event)
         self.assertTrue((self.worktree / ".github/workflows/pwn.yml").is_file())
         self.assertTrue((self.worktree / "functions/api.js").is_file())
         self.assertTrue((self.worktree / "_worker.js").is_file())
+
+    def test_digest_named_tree_is_rebuilt_from_the_verified_archive(self) -> None:
+        archive = self.root / "verified.tar"
+        self.tar_archive([("release/index.html", b"verified")], archive)
+        digest = publisher._keccak_file(archive)
+        actions = publisher.ReleaseActions(self.config())
+        cached_archive = actions.archives / f"{digest[2:]}.archive"
+        cached_archive.write_bytes(archive.read_bytes())
+        cached_archive.chmod(0o600)
+        preseeded = actions.trees / digest[2:]
+        preseeded.mkdir()
+        (preseeded / "index.html").write_text("malicious", encoding="utf-8")
+        (preseeded / "backdoor.js").write_text("malicious", encoding="utf-8")
+        event = publisher.ReleaseEvent(
+            1,
+            2,
+            digest,
+            1,
+            publisher.ZERO_DIGEST,
+            "https://example.com/release.tar",
+            5,
+            hash32("block-5"),
+            hash32("tx-5"),
+            0,
+            0,
+        )
+
+        actions.apply(event)
+
+        self.assertEqual((self.worktree / "index.html").read_text(), "verified")
+        self.assertFalse((self.worktree / "backdoor.js").exists())
+
+    def test_digest_named_tree_cannot_bypass_a_corrupt_cached_archive(self) -> None:
+        digest = hash32("expected-archive")
+        actions = publisher.ReleaseActions(self.config())
+        (actions.archives / f"{digest[2:]}.archive").write_bytes(b"corrupt")
+        preseeded = actions.trees / digest[2:]
+        preseeded.mkdir()
+        (preseeded / "index.html").write_text("malicious", encoding="utf-8")
+        event = publisher.ReleaseEvent(
+            1,
+            2,
+            digest,
+            1,
+            publisher.ZERO_DIGEST,
+            "https://example.com/release.tar",
+            5,
+            hash32("block-5"),
+            hash32("tx-5"),
+            0,
+            0,
+        )
+
+        with self.assertRaisesRegex(publisher.PublisherError, "digest is corrupt"):
+            actions.apply(event)
+
+        self.assertEqual((self.worktree / "index.html").read_text(), "genesis")
 
     def test_genesis_excludes_untracked_local_state(self) -> None:
         (self.worktree / ".wrangler").mkdir()
@@ -471,6 +534,66 @@ class PublisherTest(unittest.TestCase):
         genesis = publisher.ReleaseActions(self.config()).trees / "genesis"
         self.assertFalse((genesis / ".wrangler").exists())
         self.assertEqual((genesis / "index.html").read_text(), "genesis")
+
+    def test_canonical_genesis_reconciliation_repairs_direct_target_drift(self) -> None:
+        actions = publisher.ReleaseActions(self.config())
+        (self.worktree / "index.html").write_text("drifted", encoding="utf-8")
+        (self.worktree / "unapproved.html").write_text("drifted", encoding="utf-8")
+
+        actions.apply(None)
+
+        self.assertEqual((self.worktree / "index.html").read_text(), "genesis")
+        self.assertFalse((self.worktree / "unapproved.html").exists())
+
+    def test_hosted_reconciliation_commits_and_pushes_direct_target_drift(self) -> None:
+        remote = self.root / "governed.git"
+        subprocess.run(["/usr/bin/git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(self.worktree),
+                "remote",
+                "set-url",
+                "origin",
+                str(remote),
+            ],
+            check=True,
+        )
+        with mock.patch("publisher.GITHUB_REMOTE", str(remote)):
+            actions = publisher.ReleaseActions(
+                self.config(git_commit=True, git_push=True)
+            )
+            (self.worktree / "index.html").write_text("drifted", encoding="utf-8")
+            (self.worktree / "unapproved.html").write_text("drifted", encoding="utf-8")
+
+            actions.apply(None)
+
+        pushed = subprocess.run(
+            [
+                "/usr/bin/git",
+                "--git-dir",
+                str(remote),
+                "show",
+                "main:index.html",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertEqual(pushed, "genesis")
+        missing = subprocess.run(
+            [
+                "/usr/bin/git",
+                "--git-dir",
+                str(remote),
+                "cat-file",
+                "-e",
+                "main:unapproved.html",
+            ],
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertNotEqual(missing.returncode, 0)
 
     def test_replace_worktree_is_exact_and_preserves_only_git_control(self) -> None:
         (self.worktree / "old.txt").write_text("old", encoding="utf-8")
@@ -769,6 +892,46 @@ class PublisherTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop test"):
                 publisher._run(self.config(), once=False)
         watcher.sync_once.assert_called_once_with()
+
+    def test_one_shot_reconciles_even_when_no_new_event_exists(self) -> None:
+        watcher = mock.Mock()
+        watcher.sync_once.return_value = 0
+        watcher.state = {"canonical": None}
+        actions = mock.Mock()
+        with (
+            mock.patch("publisher.JsonRpc", return_value=mock.Mock()),
+            mock.patch("publisher.ReleaseActions", return_value=actions),
+            mock.patch("publisher.ReleaseWatcher", return_value=watcher),
+        ):
+            publisher._run(self.config(), once=True)
+        watcher.sync_once.assert_called_once_with()
+        actions.apply.assert_called_once_with(None)
+
+    def test_one_shot_reconciles_the_existing_canonical_release(self) -> None:
+        event = publisher.ReleaseEvent(
+            1,
+            2,
+            hash32("canonical"),
+            1,
+            publisher.ZERO_DIGEST,
+            "https://example.com/release.tar",
+            5,
+            hash32("block-5"),
+            hash32("tx-5"),
+            0,
+            0,
+        )
+        watcher = mock.Mock()
+        watcher.sync_once.return_value = 0
+        watcher.state = {"canonical": event.to_dict()}
+        actions = mock.Mock()
+        with (
+            mock.patch("publisher.JsonRpc", return_value=mock.Mock()),
+            mock.patch("publisher.ReleaseActions", return_value=actions),
+            mock.patch("publisher.ReleaseWatcher", return_value=watcher),
+        ):
+            publisher._run(self.config(), once=True)
+        actions.apply.assert_called_once_with(event)
 
     def test_runtime_state_and_git_home_must_be_private_real_directories(self) -> None:
         self.state.mkdir(mode=0o777)

@@ -1215,11 +1215,6 @@ class ReleaseActions:
     def _cached_tree(self, event: ReleaseEvent) -> Path:
         digest_name = event.digest[2:]
         tree = self.trees / digest_name
-        if tree.exists():
-            if not tree.is_dir() or tree.is_symlink():
-                raise PublisherError("artifact cache tree is unsafe")
-            return tree
-
         archive_path = self.archives / f"{digest_name}.archive"
         if not archive_path.exists():
             fd, temporary_name = tempfile.mkstemp(prefix=f".{digest_name}.", dir=self.archives)
@@ -1239,17 +1234,24 @@ class ReleaseActions:
                     temporary_archive.unlink()
                 except FileNotFoundError:
                     pass
-        else:
-            archive_mode = archive_path.lstat().st_mode
-            if not stat.S_ISREG(archive_mode) or stat.S_ISLNK(archive_mode):
-                raise PublisherError("cached raw artifact is not a regular file")
-            if _keccak_file(archive_path).lower() != event.digest.lower():
-                raise PublisherError("cached raw artifact digest is corrupt")
+        archive_mode = archive_path.lstat().st_mode
+        if not stat.S_ISREG(archive_mode) or stat.S_ISLNK(archive_mode):
+            raise PublisherError("cached raw artifact is not a regular file")
+        if _keccak_file(archive_path).lower() != event.digest.lower():
+            raise PublisherError("cached raw artifact digest is corrupt")
 
         temporary_tree = Path(tempfile.mkdtemp(prefix=f".{digest_name}.", dir=self.trees))
         temporary_tree.rmdir()
         try:
             extract_archive(archive_path, temporary_tree, self.cfg)
+            try:
+                tree_mode = tree.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISDIR(tree_mode) or stat.S_ISLNK(tree_mode):
+                    raise PublisherError("artifact cache tree is unsafe")
+                _remove_no_follow(tree)
             os.replace(temporary_tree, tree)
         finally:
             if temporary_tree.exists():
@@ -1611,6 +1613,8 @@ def _run(cfg: Config, once: bool) -> None:
                 count = watcher.sync_once()
                 if count:
                     print(f"applied/reconciled {count} confirmed release(s)", flush=True)
+                if once:
+                    actions.apply(_event_from_state(watcher.state.get("canonical")))
             except PublisherError as exc:
                 if once:
                     raise
