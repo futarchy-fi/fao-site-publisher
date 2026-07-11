@@ -1,0 +1,64 @@
+name: Publish accepted FAO site release
+
+on:
+  workflow_dispatch:
+    inputs:
+      initialize:
+        description: Initialize absent publisher-state from the governed main branch
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions: {}
+
+concurrency:
+  group: fao-site-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      ${{ github.ref == 'refs/heads/main' &&
+          (vars.PUBLISHER_ENABLED == 'true' ||
+           (github.event_name == 'workflow_dispatch' && inputs.initialize)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch exact publisher commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          [[ "$GITHUB_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          publisher="$RUNNER_TEMP/publisher"
+          /usr/bin/git init -q "$publisher"
+          /usr/bin/git -C "$publisher" -c protocol.version=2 fetch \
+            --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          test "$(/usr/bin/git -C "$publisher" rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          /usr/bin/git -C "$publisher" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+      - name: Install hash-pinned dependency
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          publisher="$RUNNER_TEMP/publisher"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --disable-pip-version-check \
+            --require-hashes -r "$publisher/requirements.linux-x86_64.txt"
+      - name: Run publisher host once
+        shell: bash
+        env:
+          FAO_INITIALIZE: ${{ inputs.initialize }}
+          FAO_RPC_URL: ${{ vars.FAO_RPC_URL }}
+          FAO_WITNESS_RPC_URL: ${{ vars.FAO_WITNESS_RPC_URL }}
+          FAO_TARGET_ACTIONS_DISABLED: ${{ vars.FAO_TARGET_ACTIONS_DISABLED }}
+          FAO_GOVERNED_SITE_DEPLOY_KEY: ${{ secrets.FAO_GOVERNED_SITE_DEPLOY_KEY }}
+          FAO_PUBLISHER_STATE_DEPLOY_KEY: ${{ secrets.FAO_PUBLISHER_STATE_DEPLOY_KEY }}
+          FAO_PUBLISHER_STATE_HMAC_KEY: ${{ secrets.FAO_PUBLISHER_STATE_HMAC_KEY }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          publisher="$RUNNER_TEMP/publisher"
+          "$RUNNER_TEMP/venv/bin/python" "$publisher/github_actions_host.py"
