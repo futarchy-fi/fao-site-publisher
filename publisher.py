@@ -542,7 +542,11 @@ class ReleaseEvent:
             "log_index",
         ):
             _require_int(getattr(self, name), f"release event {name}")
-        if not isinstance(self.uri, str) or not 0 < len(self.uri.encode("utf-8")) <= 256:
+        try:
+            uri_bytes = self.uri.encode("utf-8", errors="surrogateescape")
+        except (AttributeError, UnicodeEncodeError):
+            uri_bytes = b""
+        if not 0 < len(uri_bytes) <= 256:
             raise PublisherError("release event has malformed artifact URI")
 
     def to_dict(self) -> dict[str, Any]:
@@ -607,10 +611,7 @@ def decode_release_log(log: dict[str, Any]) -> ReleaseEvent:
         or any(data[uri_end:padded_end])
     ):
         raise RpcError("invalid artifactURI ABI length")
-    try:
-        uri = data[uri_start:uri_end].decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise RpcError("artifactURI is not UTF-8") from exc
+    uri = data[uri_start:uri_end].decode("utf-8", errors="surrogateescape")
 
     block_hash = str(log.get("blockHash", "")).lower()
     tx_hash = str(log.get("transactionHash", "")).lower()
@@ -802,10 +803,14 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def artifact_url(uri: str, gateway: str) -> str:
     if not isinstance(uri, str) or any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127 or character == "\\"
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        or 0xD800 <= ord(character) <= 0xDFFF
+        or character == "\\"
         for character in uri
     ):
-        raise UnsafeArtifact("artifact URI contains unsafe characters")
+        raise UnsafeArtifact("artifact URI is not valid UTF-8 or contains unsafe characters")
     try:
         parsed = urllib.parse.urlsplit(uri)
         port = parsed.port
@@ -908,6 +913,7 @@ class ArchiveEntry:
     relative_path: PurePosixPath
     size: int
     is_directory: bool
+    executable: bool
     source: Any
 
 
@@ -942,15 +948,17 @@ def _collision_key(parts: Iterable[str]) -> str:
     return "/".join(unicodedata.normalize("NFC", part).casefold() for part in parts)
 
 
-def _validate_entries(raw: list[tuple[str, int, bool, Any]], limits: ArchiveLimits) -> list[ArchiveEntry]:
+def _validate_entries(
+    raw: list[tuple[str, int, bool, bool, Any]], limits: ArchiveLimits
+) -> list[ArchiveEntry]:
     if not raw:
         raise UnsafeArtifact("archive has no entries")
-    parsed: list[tuple[tuple[str, ...], int, bool, Any, str]] = []
+    parsed: list[tuple[tuple[str, ...], int, bool, bool, Any, str]] = []
     roots: set[str] = set()
-    for name, size, is_directory, source in raw:
+    for name, size, is_directory, executable, source in raw:
         parts = _path_parts(name)
         roots.add(_collision_key(parts[:1]))
-        parsed.append((parts, size, is_directory, source, name))
+        parsed.append((parts, size, is_directory, executable, source, name))
     if len(roots) != 1:
         raise UnsafeArtifact("archive must contain exactly one top-level directory")
 
@@ -959,7 +967,7 @@ def _validate_entries(raw: list[tuple[str, int, bool, Any]], limits: ArchiveLimi
     total = 0
     files = 0
     root_entries = 0
-    for parts, size, is_directory, source, name in parsed:
+    for parts, size, is_directory, executable, source, name in parsed:
         if len(parts) == 1:
             if not is_directory:
                 raise UnsafeArtifact("archive root must be a directory")
@@ -989,7 +997,14 @@ def _validate_entries(raw: list[tuple[str, int, bool, Any]], limits: ArchiveLimi
                 raise UnsafeArtifact("archive expanded size or file count exceeds limit")
         seen[key] = is_directory
         entries.append(
-            ArchiveEntry(name, PurePosixPath(*relative_parts), size, is_directory, source)
+            ArchiveEntry(
+                name,
+                PurePosixPath(*relative_parts),
+                size,
+                is_directory,
+                executable,
+                source,
+            )
         )
     if files == 0:
         raise UnsafeArtifact("archive contains no regular files")
@@ -997,20 +1012,20 @@ def _validate_entries(raw: list[tuple[str, int, bool, Any]], limits: ArchiveLimi
 
 
 def _tar_entries(archive: tarfile.TarFile, limits: ArchiveLimits) -> list[ArchiveEntry]:
-    raw: list[tuple[str, int, bool, Any]] = []
+    raw: list[tuple[str, int, bool, bool, Any]] = []
     for index, member in enumerate(archive):
         if index > limits.max_files:
             raise UnsafeArtifact("archive entry count exceeds limit")
         if member.isdir():
-            raw.append((member.name, 0, True, member))
+            raw.append((member.name, 0, True, False, member))
         elif member.isreg():
-            raw.append((member.name, member.size, False, member))
+            raw.append((member.name, member.size, False, bool(member.mode & 0o111), member))
         else:
             raise UnsafeArtifact("tar links and special members are forbidden")
     return _validate_entries(raw, limits)
 
 
-def _write_member(stream: Any, target: Path, expected_size: int) -> None:
+def _write_member(stream: Any, target: Path, expected_size: int, executable: bool) -> None:
     target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     written = 0
     with target.open("xb") as output:
@@ -1021,7 +1036,7 @@ def _write_member(stream: Any, target: Path, expected_size: int) -> None:
             output.write(chunk)
     if written != expected_size:
         raise UnsafeArtifact("archive member was shorter than declared size")
-    os.chmod(target, 0o644)
+    os.chmod(target, 0o755 if executable else 0o644)
 
 
 def extract_archive(archive_path: Path, destination: Path, cfg: Config) -> None:
@@ -1050,7 +1065,7 @@ def extract_archive(archive_path: Path, destination: Path, cfg: Config) -> None:
                     if source is None:
                         raise UnsafeArtifact("tar regular member has no data")
                     with source:
-                        _write_member(source, target, entry.size)
+                        _write_member(source, target, entry.size, entry.executable)
     except (tarfile.TarError, OSError, UnicodeError, ValueError) as exc:
         raise UnsafeArtifact(f"artifact is not a valid tar archive: {exc}") from exc
 
@@ -1089,13 +1104,15 @@ def _copy_regular_tree(source: Path, destination: Path) -> None:
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
             with item.open("rb") as input_handle, target.open("xb") as output_handle:
                 shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
-            os.chmod(target, 0o644)
+            os.chmod(target, 0o755 if mode & 0o111 else 0o644)
 
 
 def _validate_release_tree(source: Path, cfg: Config) -> None:
     if not source.is_dir() or source.is_symlink():
         raise UnsafeArtifact("release tree must be a real directory")
-    raw: list[tuple[str, int, bool, Any]] = [("release", 0, True, None)]
+    raw: list[tuple[str, int, bool, bool, Any]] = [
+        ("release", 0, True, False, None)
+    ]
     for root, directories, files in os.walk(source, topdown=True, followlinks=False):
         root_path = Path(root)
         relative = root_path.relative_to(source)
@@ -1107,7 +1124,13 @@ def _validate_release_tree(source: Path, cfg: Config) -> None:
                 raise UnsafeArtifact("release tree contains a non-directory entry")
             safe_directories.append(name)
             raw.append(
-                ("/".join(("release", *(relative / name).parts)), 0, True, None)
+                (
+                    "/".join(("release", *(relative / name).parts)),
+                    0,
+                    True,
+                    False,
+                    None,
+                )
             )
         directories[:] = safe_directories
         for name in files:
@@ -1120,6 +1143,7 @@ def _validate_release_tree(source: Path, cfg: Config) -> None:
                     "/".join(("release", *(relative / name).parts)),
                     info.st_size,
                     False,
+                    bool(info.st_mode & 0o111),
                     None,
                 )
             )
@@ -1181,7 +1205,7 @@ class ReleaseActions:
                 target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
                 with source.open("rb") as input_handle, target.open("xb") as output_handle:
                     shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
-                os.chmod(target, 0o644)
+                os.chmod(target, 0o755 if mode & 0o111 else 0o644)
             _validate_release_tree(temporary, self.cfg)
             os.replace(temporary, genesis)
         finally:
@@ -1357,7 +1381,8 @@ class ReleaseActions:
                 raise PublisherError("git hash-object returned an unexpected object count")
             self._git("read-tree", "--empty")
             index_info = "".join(
-                f"100644 {object_id}\t{path}\n"
+                f"{'100755' if (self.cfg.worktree / path).stat().st_mode & 0o111 else '100644'} "
+                f"{object_id}\t{path}\n"
                 for path, object_id in zip(paths, object_ids)
             )
             self._git("update-index", "--index-info", input_text=index_info)
