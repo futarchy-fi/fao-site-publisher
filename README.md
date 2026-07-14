@@ -34,6 +34,29 @@ release alone.
   `_worker.js`, `functions/`, build configuration, and server code. None of it
   is imported or executed by the publisher.
 
+Create a reproducible archive from one exact Git commit, then encode the
+corresponding `SiteRelease` payload:
+
+```sh
+python3 release_artifact.py bundle --repo ../fao-governed-site --ref HEAD \
+  --archive dist/site.tar --out dist/site.json
+python3 release_artifact.py payload --archive dist/site.tar \
+  --uri ipfs://bafy.../site.tar --nonce 1 \
+  --expected-current-digest 0x0000000000000000000000000000000000000000000000000000000000000000 \
+  --out dist/site.payload.json
+```
+
+The bundle command resolves the ref once, uses Git's tar writer with a pinned
+umask, validates the result with the publisher's own archive rules, and hashes
+the exact archive bytes with Ethereum Keccak-256. It fetches only that commit
+into a temporary no-ref bare repository, with replacement objects and ambient
+Git configuration/attributes disabled, so local tags and repository metadata
+cannot alter the reported commit's archive. The manifest records the exact Git
+version, and the producer rejects symlinks, gitlinks/submodules, or any tracked
+entry other than a regular or executable file. The payload command stages one
+private, size-bounded archive copy before validation and hashing, then emits the
+exact `abi.encode(SiteRelease)` bytes and their Keccak-256 hash.
+
 The worktree is replaced exactly with the validated regular-file tree while
 its existing `.git` control path is preserved. A private cache allows a
 confirmed deep-reorg rescan to restore the canonical prior release (or the
