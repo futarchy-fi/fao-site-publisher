@@ -48,9 +48,14 @@ python3 release_artifact.py payload --archive dist/site.tar \
 
 The bundle command resolves the ref once, uses Git's tar writer with a pinned
 umask, validates the result with the publisher's own archive rules, and hashes
-the exact archive bytes with Ethereum Keccak-256. The payload command repeats
-archive validation and emits the exact `abi.encode(SiteRelease)` bytes and
-their Keccak-256 hash.
+the exact archive bytes with Ethereum Keccak-256. It fetches only that commit
+into a temporary no-ref bare repository, with replacement objects and ambient
+Git configuration/attributes disabled, so local tags and repository metadata
+cannot alter the reported commit's archive. The manifest records the exact Git
+version, and the producer rejects symlinks, gitlinks/submodules, or any tracked
+entry other than a regular or executable file. The payload command stages one
+private, size-bounded archive copy before validation and hashing, then emits the
+exact `abi.encode(SiteRelease)` bytes and their Keccak-256 hash.
 
 The worktree is replaced exactly with the validated regular-file tree while
 its existing `.git` control path is preserved. A private cache allows a

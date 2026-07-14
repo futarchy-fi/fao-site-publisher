@@ -3,11 +3,14 @@ from __future__ import annotations
 import io
 import json
 import os
+import stat
 import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from Crypto.Hash import keccak
 
@@ -85,6 +88,7 @@ class ReleaseArtifactTest(unittest.TestCase):
             {
                 "schemaVersion": 1,
                 "sourceCommit": commit,
+                "gitVersion": self.git("--version"),
                 "archiveBytes": first_archive.stat().st_size,
                 "artifactDigest": publisher._keccak_file(first_archive),
             },
@@ -115,6 +119,118 @@ class ReleaseArtifactTest(unittest.TestCase):
             release_artifact.create_bundle(self.repo, "HEAD", archive, out)
         self.assertFalse(archive.exists())
         self.assertFalse(out.exists())
+
+    def test_bundle_preserves_committed_parent_without_shallow_decorations(self) -> None:
+        parent = self.commit_site()
+        (self.repo / ".gitattributes").write_text(
+            "version.txt export-subst\n", encoding="utf-8"
+        )
+        (self.repo / "version.txt").write_text(
+            "P=$Format:%P$ D=$Format:%D$\n", encoding="utf-8"
+        )
+        self.git("add", ".gitattributes", "version.txt")
+        self.git("commit", "-q", "-m", "version metadata")
+
+        archive = self.root / "parents.tar"
+        release_artifact.create_bundle(
+            self.repo, "HEAD", archive, self.root / "parents.json"
+        )
+        with tarfile.open(archive, "r:") as tar:
+            version = tar.extractfile("release/version.txt").read().decode()
+        self.assertEqual(version, f"P={parent} D=\n")
+        self.assertNotIn("grafted", version)
+
+    def test_bundle_rejects_a_committed_gitlink(self) -> None:
+        target = self.commit_site()
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{target},component")
+        self.git("commit", "-q", "-m", "gitlink")
+
+        with self.assertRaisesRegex(publisher.UnsafeArtifact, "links and special"):
+            release_artifact.create_bundle(
+                self.repo,
+                "HEAD",
+                self.root / "gitlink.tar",
+                self.root / "gitlink.json",
+            )
+
+    def test_bundle_is_hermetic_to_replace_refs_attributes_and_tags(self) -> None:
+        self.commit_site()
+        (self.repo / ".gitattributes").write_text(
+            "version.txt export-subst\n", encoding="utf-8"
+        )
+        (self.repo / "version.txt").write_text("$Format:%D$\n", encoding="utf-8")
+        self.git("add", ".gitattributes", "version.txt")
+        self.git("commit", "-q", "-m", "versioned site")
+        commit = self.git("rev-parse", "HEAD")
+
+        baseline_archive = self.root / "baseline.tar"
+        baseline = release_artifact.create_bundle(
+            self.repo, commit, baseline_archive, self.root / "baseline.json"
+        )
+
+        def assert_same(name: str) -> None:
+            archive = self.root / f"{name}.tar"
+            result = release_artifact.create_bundle(
+                self.repo, commit, archive, self.root / f"{name}.json"
+            )
+            self.assertEqual(result["sourceCommit"], commit)
+            self.assertEqual(result, baseline)
+            self.assertEqual(archive.read_bytes(), baseline_archive.read_bytes())
+
+        info_attributes = self.repo / ".git" / "info" / "attributes"
+        info_attributes.write_text("index.html export-ignore\n", encoding="utf-8")
+        assert_same("local-attributes")
+        ambient_attributes = self.root / "ambient.attributes"
+        ambient_attributes.write_text("deploy.sh export-ignore\n", encoding="utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.attributesFile",
+                "GIT_CONFIG_VALUE_0": str(ambient_attributes),
+            },
+        ):
+            assert_same("ambient-config")
+        self.git("tag", "local-only-tag", commit)
+        assert_same("local-tag")
+        (self.repo / "index.html").write_text("replacement\n", encoding="utf-8")
+        self.git("add", "index.html")
+        self.git("commit", "-q", "-m", "replacement site")
+        replacement = self.git("rev-parse", "HEAD")
+        self.git("replace", commit, replacement)
+        assert_same("replacement-ref")
+
+    def test_output_paths_collapse_symlinked_parent_aliases(self) -> None:
+        self.commit_site()
+        real = self.root / "real"
+        real.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+
+        with self.assertRaisesRegex(release_artifact.ArtifactError, "different files"):
+            release_artifact.create_bundle(
+                self.repo, "HEAD", real / "shared", alias / "shared"
+            )
+        self.assertFalse((real / "shared").exists())
+        with self.assertRaisesRegex(release_artifact.ArtifactError, "different files"):
+            release_artifact.create_bundle(
+                self.repo, "HEAD", real / "CaseAlias", real / "casealias"
+            )
+
+        archive = real / "site.tar"
+        release_artifact.create_bundle(
+            self.repo, "HEAD", archive, real / "site.json"
+        )
+        with self.assertRaisesRegex(release_artifact.ArtifactError, "different files"):
+            release_artifact.create_payload(
+                archive,
+                "ipfs://bafy123/site.tar",
+                1,
+                ZERO_DIGEST,
+                alias / "site.tar",
+            )
+        with tarfile.open(archive, "r:") as tar:
+            self.assertIsNotNone(tar.getmember("release/index.html"))
 
     def test_payload_matches_single_dynamic_tuple_abi_and_exact_archive_hash(self) -> None:
         self.commit_site()
@@ -218,6 +334,65 @@ class ReleaseArtifactTest(unittest.TestCase):
             release_artifact.create_payload(
                 linked_archive, "ipfs://bafy123/site.tar", 1, ZERO_DIGEST, out
             )
+
+        if hasattr(os, "mkfifo"):
+            fifo = self.root / "archive.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(publisher.UnsafeArtifact, "bounded regular file"):
+                release_artifact.create_payload(
+                    fifo, "ipfs://bafy123/site.tar", 1, ZERO_DIGEST, out
+                )
+
+    def test_archive_staging_bounds_growth_after_fstat(self) -> None:
+        archive = self.root / "growing.tar"
+        archive.write_bytes(b"12345")
+        staged = self.root / "staged"
+        staged.mkdir()
+        fake_info = SimpleNamespace(st_mode=stat.S_IFREG, st_size=1)
+        with mock.patch.object(
+            release_artifact.os, "fstat", return_value=fake_info
+        ):
+            with mock.patch.object(
+                release_artifact.ARCHIVE_LIMITS, "max_archive_bytes", 4
+            ), self.assertRaisesRegex(
+                publisher.UnsafeArtifact, "bounded regular file"
+            ):
+                release_artifact._stage_archive(archive, staged)
+
+        occupied = self.root / "occupied"
+        occupied.mkdir()
+        (occupied / "site.tar").write_bytes(b"exists")
+        with self.assertRaisesRegex(publisher.UnsafeArtifact, "bounded regular file"):
+            release_artifact._stage_archive(archive, occupied)
+
+    def test_payload_validates_and_hashes_one_private_staged_copy(self) -> None:
+        self.commit_site()
+        archive = self.root / "site.tar"
+        release_artifact.create_bundle(
+            self.repo, "HEAD", archive, self.root / "site.json"
+        )
+        expected_digest = publisher._keccak_file(archive)
+        validate = release_artifact._validate_archive
+
+        def swap_source_after_validation(path: Path) -> None:
+            validate(path)
+            archive.write_bytes(b"unvalidated replacement")
+
+        with mock.patch.object(
+            release_artifact,
+            "_validate_archive",
+            side_effect=swap_source_after_validation,
+        ):
+            result = release_artifact.create_payload(
+                archive,
+                "ipfs://bafy123/site.tar",
+                1,
+                ZERO_DIGEST,
+                self.root / "payload.json",
+            )
+
+        self.assertEqual(result["artifactDigest"], expected_digest)
+        self.assertEqual(archive.read_bytes(), b"unvalidated replacement")
 
 
 if __name__ == "__main__":
